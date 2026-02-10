@@ -1,66 +1,105 @@
 '''
-    This script currentlt "JUST WORKS"
+    This script currently "JUST WORKS"
     Nothing fancy yet.
     Enjoy :)
 '''
 import time
 import logging
-import os
+from pathlib import Path
 import argparse
-from selenium.webdriver.remote.remote_connection import LOGGER as seleniumLogger
-from seleniumwire import webdriver
+from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException
-import chromedriver_autoinstaller
 
 # Banner
 banner = '''
 ---------------------------------
-GSNW                                                                                                             
-Find me on X (Twitter) @retkoussa 
+GSNW
+Find me on X (Twitter) @retkoussa
 ---------------------------------
 '''
 
-# Install the Chrome driver automatically
-chromedriver_autoinstaller.install()
-
 # Disable logging for Selenium and other verbose outputs
-seleniumLogger.setLevel(logging.WARNING)
-logging.getLogger('WDM').setLevel(logging.NOTSET)
+logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-# Suppress DevTools listening message
-options = Options()
-options.add_argument("--log-level=3")
-options.add_argument("--silent")
+# Dedicated profile directory — separate from the user's main Chrome profile
+# so it never conflicts with a running Chrome instance.
+GSNW_PROFILE_DIR = Path.home() / ".config" / "gsnw" / "chrome-profile"
 
-def search_github(query):
+
+def clean_stale_locks(profile_dir):
+    """Remove stale Chrome lock files left behind by a previous crash."""
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+        lock = profile_dir / name
+        if lock.exists() or lock.is_symlink():
+            lock.unlink(missing_ok=True)
+
+
+def login_to_github():
+    """Launch a visible Chrome window so the user can log into GitHub."""
+    GSNW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    clean_stale_locks(GSNW_PROFILE_DIR)
+
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(f"--user-data-dir={GSNW_PROFILE_DIR}")
+    chrome_options.add_argument("--log-level=3")
+
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.get("https://github.com/login")
+    print("A Chrome window has been opened.")
+    print("Please log into GitHub in the browser window (including MFA if prompted)...")
+    print("Waiting for login to complete...")
+
+    # Wait up to 5 minutes for the user to fully log in (including MFA)
+    for _ in range(150):
+        time.sleep(2)
+        try:
+            # GitHub sets a meta tag with the username when logged in
+            user_meta = driver.execute_script(
+                "var el = document.querySelector('meta[name=\"user-login\"]');"
+                "return el ? el.getAttribute('content') : null;"
+            )
+            if user_meta:
+                print(f"Logged in as: {user_meta}")
+                break
+        except Exception:
+            # Browser was closed manually
+            print("Browser closed.")
+            return
+
+    print("Login detected! Saving session...")
+    driver.quit()
+    print("Login saved. You can now run searches.")
+
+
+def search_github(query, ext=None):
     matched_words = set()  # Use a set to store unique matched words
     page_number = 1
-    base_url = f"https://github.com/search?q=path%3A%2F{query}&type=code&p="
+    search_q = f"path%3A%2F{query}"
+    if ext:
+        ext = ext.lstrip(".")
+        search_q += f"+path%3A*.{ext}"
+    base_url = f"https://github.com/search?q={search_q}&type=code&p="
+
+    GSNW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    clean_stale_locks(GSNW_PROFILE_DIR)
 
     # Setup Chrome options
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Ensure GUI is off
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--profile-directory=Default")
-    
-    # Current user
-    current_user = os.getlogin()
-    
-    # IMPORTANT
-    # Make sure you're logged in to Github on the specificed Chrome Profile
-    chrome_options.add_argument(f"--user-data-dir=C:\\Users\\{current_user}\\AppData\\Local\\Google\\Chrome\\User Data")
+    chrome_options.add_argument(f"--user-data-dir={GSNW_PROFILE_DIR}")
     chrome_options.add_argument("--log-level=3")
-    chrome_options.add_argument("--silent")
 
-    # Create a new instance of the Chrome driver
-    driver = webdriver.Chrome(service=Service(), options=chrome_options)
+    # Selenium 4.6+ handles driver management automatically
+    driver = webdriver.Chrome(options=chrome_options)
 
     while True:
         # Construct the URL for the current page
@@ -68,9 +107,17 @@ def search_github(query):
         driver.get(url)
 
         try:
+            # Detect "sign in" prompt — means user hasn't logged in yet
+            sign_in = driver.find_elements(By.XPATH, "//*[contains(text(), 'Sign in to search code')]")
+            if sign_in:
+                print("Error: Not logged into GitHub.")
+                print("Run with --login first to authenticate:")
+                print("  python gsnw.py --login")
+                break
+
             # Wait until the elements are located or timeout after 10 seconds
             elements = WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CLASS_NAME, "prc-Link-Link-85e08"))
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".search-title a[href*='/blob/']"))
             )
 
             if elements:
@@ -97,35 +144,40 @@ def search_github(query):
             # Increment the page number for the next iteration
             page_number += 1
             time.sleep(2)  # Add a short delay to avoid making requests too quickly
-        except Exception as e:
-            print(f"Error: {e}")
+        except Exception:
+            # Timeout means no more results on this page
             break
 
     driver.quit()
     return list(matched_words)
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("search_query", help="The search query to use for GitHub code search")
+    parser.add_argument("search_query", nargs='?', default=None, help="The search query to use for GitHub code search")
     parser.add_argument("output_file", nargs='?', default=None, help="The output file to save the results")
     parser.add_argument("-silent", action="store_true", help="Suppress the banner")
+    parser.add_argument("-e", "--ext", default=None, help="Filter by file extension (e.g. aspx, config, php)")
+    parser.add_argument("--login", action="store_true", help="Open a browser to log into GitHub")
 
     args = parser.parse_args()
-    search_query = args.search_query
-    output_file = args.output_file
 
     if not args.silent:
         print(banner)
 
-    matched_words = search_github(search_query)
+    if args.login:
+        login_to_github()
+        return
 
-    if output_file:
-        with open(output_file, "w") as file:
+    if not args.search_query:
+        parser.error("search_query is required (or use --login to authenticate)")
+
+    matched_words = search_github(args.search_query, ext=args.ext)
+
+    if args.output_file:
+        with open(args.output_file, "w") as file:
             for word in matched_words:
                 file.write(word + "\n")
-    
-    # Yeah im aware its bad execution D:
-
     else:
         print('-------------------------')
         for word in matched_words:
